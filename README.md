@@ -165,3 +165,4 @@ Other single-file tools in this portfolio that pair with this one:
 
 - [taskpulse](https://github.com/uhsear/taskpulse) - find the scheduled tasks that are silently failing
 - [svcguard](https://github.com/uhsear/svcguard) - keep a service up around the risky part of the job
+- [logsift](https://github.com/uhsear/logsift) - read the logs back out once the harness is writing them
