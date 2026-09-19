@@ -1,6 +1,7 @@
 # jobharness
 
-One import gives an unattended script logging, retry, resume, and a safe unzip.
+One import gives an unattended script logging, retry, resume, a safe unzip, and an FTPS client
+that talks to servers which require TLS session reuse.
 
 Scripts that run on a scheduler all need the same seven things, and every script re-derives them
 slightly differently. Measured directly across the one production tree that motivated this file:
@@ -8,6 +9,18 @@ slightly differently. Measured directly across the one production tree that moti
 policies (prune by count, prune by age, prune never), 5 unguarded `extractall` calls, and retry
 written three different ways. jobharness is those seven things written down once, as thin wrappers
 over the standard library.
+
+The high-water mark for not having `setup_logging` is one file in that tree: a 10.5 MB, 287,171-line
+interactive console transcript, saved beside the scripts with a `.py` extension. Scanned end to end
+for dates and clock times, one line in 287,171 carries anything time-shaped, and that line is the
+interpreter's own startup banner. Not one line of output can be attributed to a run, a step, or an
+hour.
+
+**Looking for the FTPS `522 SSL connection failed; session reuse required` fix?** It is
+[`FTPSession`](#6-ftpsession) below, ten lines: the `ntransfercmd` override that passes
+`session=self.sock.session` when it wraps the data socket, for servers that enforce TLS session
+reuse (vsftpd `require_ssl_reuse`, IIS FTP). CPython bpo-19500 / gh-63699, still open. Import the
+class or copy it. Adopted, not invented - see [Credit](#credit).
 
 ```
 $ python jobharness.py --self-test
@@ -51,7 +64,8 @@ log.info(run_summary("nightly", started, steps=cp.state["completed_steps"]))
 ## What is in it
 
 Seven helpers, ranked by how often the corpus needed them. `setup_logging` is first because 26
-files needed it; `FTPSession` is last because one did. Each entry names the stdlib call it wraps,
+files needed it; `FTPSession` is last because one did. The order is corpus frequency, not value:
+`FTPSession` is the one people arrive here looking for. Each entry names the stdlib call it wraps,
 because that is all any of them is.
 
 ### 1. `setup_logging(name, log_dir, retain_days=None, retain_count=None, level=logging.INFO, console=True, now=None)`
@@ -111,8 +125,19 @@ be the thing that stops the job.
 Wraps `ftplib.FTP_TLS` with two overrides, `ntransfercmd` and `makepasv`. Adopted, not invented;
 see Credit.
 
-Reuses the control channel's TLS session on the data channel, and returns the host you already
-reached instead of the private address a NAT'd server puts in its PASV reply.
+`ntransfercmd` reuses the control channel's TLS session on the data channel. A server that enforces
+session reuse - vsftpd `require_ssl_reuse`, IIS FTP - rejects a data connection that does not, and
+vsftpd answers `522 SSL connection failed; session reuse required`. `ftplib.FTP_TLS.ntransfercmd`
+wraps the data socket with `server_hostname` only and passes no `session`, so stock ftplib cannot
+satisfy those servers. That defect is still open upstream: CPython bpo-19500 / gh-63699.
+
+`makepasv` returns the host you already reached instead of the private address a NAT'd server puts
+in its PASV reply. That half is vestigial on a current interpreter: since CPython bpo-43285,
+backported to 3.6.14, 3.7.11, 3.8.9, 3.9.3 and 3.10, `ftplib` defaults
+`trust_server_pasv_ipv4_address` to `False` and substitutes `self.sock.getpeername()[0]` itself, so
+`super().makepasv()` has already discarded the server-returned host before the override returns.
+It is kept because an interpreter older than that fix still trusts the PASV reply, and deleting it
+buys nothing.
 
 ### 7. `run_summary(name, started, finished=None, steps=None, errors=None, extra=None, width=68)`
 
@@ -136,6 +161,7 @@ approach is new here.
 1. **True FTPS session reuse is not asserted by the self-test.** That needs a real server. The
    self-test proves both methods are overridden, that constructing `FTPSession` opens no socket,
    and that `makepasv` returns the original host against a stub. Resumption itself is unclaimed.
+   On an interpreter carrying the bpo-43285 fix, only the `ntransfercmd` half changes behavior.
 2. **`Checkpoints` is generalized from a single site.** Unlike the other six, this pattern had
    exactly one prior production use, not a repeated one. It is the thinnest evidence in the module.
 3. **This is a convenience library, not novel work.** Every helper is a thin wrapper you could
