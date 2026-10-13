@@ -9,3 +9,4 @@ logs/
 credentials*
 *token*
 *.lock
+.coverage

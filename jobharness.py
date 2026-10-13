@@ -23,7 +23,7 @@ Run the offline self-test:
 
     python jobharness.py --self-test
 
-Check a run lock (reads only). Exit 0 no lock, 3 held, 4 stale:
+Check a run lock (reads only). Exit 0 no lock, 3 held, 4 stale, 5 not a lock file:
 
     python jobharness.py --lock nightly.lock --max-age 21600
 
@@ -52,7 +52,7 @@ import time
 import zipfile
 from email.message import EmailMessage
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __all__ = [
     "setup_logging",
     "safe_extract",
@@ -64,6 +64,7 @@ __all__ = [
     "ErrorCounter",
     "fingerprint",
     "step_outcome",
+    "redact",
     "FTPSession",
     "run_summary",
     "RunLock",
@@ -481,6 +482,30 @@ def fingerprint(paths):
     return "sha256:" + digest.hexdigest()
 
 
+_SECRETS = (
+    # token=..., access_token=..., password=..., api_key=... in a URL or a message
+    (re.compile(r"(?i)([A-Za-z_]*(?:token|secret|password|passwd|pwd|apikey|api_key|key"
+                r"|signature)=)[^&\s'\"]+"), r"\1<redacted>"),
+    # Authorization: Bearer abc, Authorization=abc
+    (re.compile(r"(?i)(\bauthorization\s*[:=]\s*(?:bearer\s+|basic\s+)?)[^\s,;'\"]+"),
+     r"\1<redacted>"),
+    # https://user:password@host
+    (re.compile(r"(://[^/\s:@]*:)[^@/\s]*@"), r"\1<redacted>@"),
+)
+
+
+def redact(text):
+    """Blank the value of token=, password=, Authorization: and user:pass@ patterns. Pure.
+
+    A step's reason is copied from an exception or a log message, and those
+    often hold a request URL. The state file is a new place that text lands, so
+    it is cleaned first. The patterns are a net, not a guarantee.
+    """
+    for pattern, replacement in _SECRETS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 def step_outcome(raised, skip_reason, errors):
     """Decide one step's (state, reason). Pure: no I/O.
 
@@ -557,6 +582,7 @@ class Checkpoints:
             raise ValueError("run_key must be a string, such as '2026-10-09'")
         self.path = path
         self.run_key = run_key
+        self._given = logger
         self._log = logger or logging.getLogger(__name__)
         self.state = self._load()
 
@@ -590,9 +616,15 @@ class Checkpoints:
         parent = os.path.dirname(os.path.abspath(self.path))
         os.makedirs(parent, exist_ok=True)
         tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(self.state, handle, indent=2)
-        os.replace(tmp, self.path)
+        try:
+            with open(tmp, "w", encoding="utf-8") as handle:
+                # default=str: a Path or a datetime in run.data is written as its text
+                json.dump(self.state, handle, indent=2, default=str)
+            os.replace(tmp, self.path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            raise
 
     def is_done(self, step, inputs=None):
         """True only for an ok step. With `inputs`, also only if they are unchanged."""
@@ -633,8 +665,8 @@ class Checkpoints:
             done.remove(step)
         if data:
             self.state["data"][step] = data
-        self.state["steps"][step] = {"state": state, "at": stamp,
-                                     "inputs": prints, "reason": reason}
+        self.state["steps"][step] = {"state": state, "at": stamp, "inputs": prints,
+                                     "reason": redact(reason) if reason else reason}
         self.state["last_run"] = stamp
         self.save()
 
@@ -656,12 +688,14 @@ class Checkpoints:
 
         Inputs are fingerprinted BEFORE the body runs, so a file changed while
         the step reads it does not get recorded as the version the step used.
-        While the body runs an ErrorCounter watches `logger` (default: this
-        object's logger). The step is recorded failed if the body raises (the
+        While the body runs an ErrorCounter watches `logger`. With no `logger`
+        it watches the one given to Checkpoints, and with none there either it
+        watches the ROOT logger, so an ERROR on any logger that propagates to the
+        root counts. The step is recorded failed if the body raises (the
         exception still propagates) or logs ERROR, skipped if it called
         run.skip(reason), and ok otherwise. run.data is saved with the step.
         """
-        watched = logger or self._log
+        watched = logger or self._given or logging.getLogger()
         watch = ErrorCounter()
         run = StepRun()
         prints = None
@@ -677,7 +711,13 @@ class Checkpoints:
         finally:
             watched.removeHandler(watch)
             state, why = step_outcome(raised, run.skip_reason, watch.messages)
-            self._write(name, state, why, prints, run.data)
+            try:
+                self._write(name, state, why, prints, run.data)
+            except Exception as exc:
+                if raised is None:
+                    raise
+                # a write error must not hide the error that is already propagating
+                self._log.error("step %s: its outcome could not be recorded (%s)", name, exc)
 
     def get(self, step, default=None):
         return self.state["data"].get(step, default)
@@ -769,7 +809,8 @@ def run_summary(name, started, finished=None, steps=None, errors=None, extra=Non
 FREE = "free"
 HELD = "held"
 STALE = "stale"
-EXIT_CODES = {FREE: 0, HELD: 3, STALE: 4}
+NOTLOCK = "notlock"
+EXIT_CODES = {FREE: 0, HELD: 3, STALE: 4, NOTLOCK: 5}
 
 # A lock file that exists but holds no readable record is younger than this
 # many seconds only while the run that created it is still writing it.
@@ -781,7 +822,8 @@ _STILL_ACTIVE = 259
 
 
 class LockError(RuntimeError):
-    """The run lock is held by a live run (exit_code 3) or left by a dead one (4)."""
+    """The run lock is held by a live run (exit_code 3), left by a dead one (4), or not
+    a lock file at all (5)."""
 
     def __init__(self, path, verdict, reason):
         self.path = path
@@ -818,7 +860,7 @@ def _age_text(seconds):
     return str(_dt.timedelta(seconds=max(0, int(seconds))))
 
 
-def lock_verdict(info, now_ts, this_host, max_age, alive, mtime):
+def lock_verdict(info, now_ts, this_host, max_age, alive, mtime, empty=True):
     """Decide (verdict, reason) for an existing lock file. Pure: no I/O.
 
     info     - parse_lock() of the file, or None if it holds no valid record
@@ -826,13 +868,19 @@ def lock_verdict(info, now_ts, this_host, max_age, alive, mtime):
     this_host- this machine's host name (compared case-insensitively)
     max_age  - seconds; a lock older than this is stale even if its pid lives
     alive    - alive(pid) -> bool, consulted only for a lock from this host
-    mtime    - the lock file's mtime, used only when info is None
+    mtime    - the lock file's mtime, used only when info is None and the file is empty
+    empty    - True if the file holds no text. Only an empty file can be a lock whose
+               run died between creating it and writing it; text that is not a lock
+               record is somebody's data, and is never called stale
 
     A lock is never called stale by guessing: on this host its pid is checked;
     from another host only age can decide, so without max_age it stays held.
     An age exactly equal to max_age is still held.
     """
     if info is None:
+        if not empty:
+            return NOTLOCK, ("the file holds text that is not a lock record, so it is not"
+                             " a run lock; jobharness will not remove it")
         if now_ts - mtime < _WRITE_GRACE:
             return HELD, ("the lock file holds no readable record and is %s old, so a"
                           " starting run may still be writing it" % _age_text(now_ts - mtime))
@@ -922,8 +970,9 @@ def pid_alive(pid):
 def inspect_lock(path, max_age=None, now=None, alive=None, host=None):
     """Read a lock file and return (verdict, reason, raw_text). Reads only.
 
-    verdict is FREE (no file), HELD or STALE. A file that exists but cannot be
-    read is HELD: nothing proves its owner is gone.
+    verdict is FREE (no file), HELD, STALE or NOTLOCK (a non-empty file that is not
+    a lock record). A file that exists but cannot be read is HELD: nothing proves
+    its owner is gone.
     """
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
@@ -935,7 +984,7 @@ def inspect_lock(path, max_age=None, now=None, alive=None, host=None):
         return HELD, "the lock file cannot be read (%s), so it is treated as held" % (exc,), None
     now_ts = time.time() if now is None else now
     verdict, reason = lock_verdict(parse_lock(raw), now_ts, host or socket.gethostname(),
-                                   max_age, alive or pid_alive, mtime)
+                                   max_age, alive or pid_alive, mtime, not raw.strip())
     return verdict, reason, raw
 
 
@@ -946,6 +995,8 @@ class RunLock:
     it exactly one succeeds, and writes the pid, host, start time and a random
     token into it. If the file already exists, acquire() raises LockError:
     exit_code 3 when a live run holds it, 4 when the run that wrote it is gone.
+
+    A file that is not a lock record at all raises LockError with exit_code 5.
 
     acquire() never deletes a lock, stale or not. Two runs that both judged a
     lock stale and both deleted it would both run. Removing a stale lock is a
@@ -1016,7 +1067,8 @@ def _parse(argv):
         allow_abbrev=False,
         description="Offline self-test, and a check of a RunLock file.",
         epilog="Exit codes for --lock: 0 no lock (or a stale one removed), 3 held, "
-               "4 stale. 2 is a usage error. Only --apply removes anything.",
+               "4 stale, 5 not a lock file. 2 is a usage error. Only --apply "
+               "removes anything.",
     )
     ap.add_argument("--self-test", dest="self_test", action="store_true",
                     help="run the offline assertions and exit")
@@ -1030,7 +1082,9 @@ def _parse(argv):
     args = ap.parse_args(argv)
     if args.max_age is not None and args.max_age < 0:
         ap.error("--max-age cannot be negative")
-    if (args.apply or args.max_age is not None) and not args.lock:
+    if args.lock is not None and not args.lock.strip():
+        ap.error("--lock needs a path; an empty one would check nothing and read as free")
+    if (args.apply or args.max_age is not None) and args.lock is None:
         ap.error("--apply and --max-age need --lock")
     return args
 
@@ -1051,6 +1105,8 @@ def _run_lock(path, max_age, apply):
         return 0
     if apply and verdict == HELD:
         print("Nothing was removed: a held lock is never removed.")
+    if apply and verdict == NOTLOCK:
+        print("Nothing was removed: this file is not a lock. Check the path.")
     return EXIT_CODES[verdict]
 
 
@@ -1058,7 +1114,7 @@ def main(argv=None):
     args = _parse(sys.argv[1:] if argv is None else argv)
     if args.self_test:
         return _self_test()
-    if args.lock:
+    if args.lock is not None:
         return _run_lock(args.lock, args.max_age, args.apply)
     print(__doc__.strip())
     print("\njobharness %s, run with --self-test" % (__version__,))
@@ -1075,6 +1131,11 @@ def _touch(path, mtime=None, body="x"):
     if mtime is not None:
         os.utime(path, (mtime, mtime))
     return path
+
+
+def _read(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.read()
 
 
 def _make_zip(path, members):
@@ -1165,6 +1226,7 @@ def _lock_text(pid, host, ts, token="t0k3n", started="2026-01-01T00:00:00"):
 
 def _self_test():
     import io
+    import pathlib
     import subprocess
     import tempfile
     import types
@@ -1172,6 +1234,7 @@ def _self_test():
 
     passed = [0]
     failed = []
+    skipped = []
 
     def check(cond, label):
         if cond:
@@ -1180,6 +1243,11 @@ def _self_test():
         else:
             failed.append(label)
             print("FAIL  %s" % label)
+
+    def skip(label):
+        """A check that could not run here. Not counted as an assertion, never as a pass."""
+        skipped.append(label)
+        print("SKIP  %s" % label)
 
     def raises(fn, label, exc=ValueError):
         try:
@@ -1209,6 +1277,10 @@ def _self_test():
                 print("  FAILED: %s" % label)
             return 1
         print("%d assertions, 0 failed" % total)
+        if skipped:
+            print("%d check(s) SKIPPED, not run, so not verified on this host:" % len(skipped))
+            for label in skipped:
+                print("  SKIPPED: %s" % label)
         return 0
 
     def cli(argv):
@@ -1372,17 +1444,20 @@ def _self_test():
 
         # A symlinked/junctioned subdirectory of dest: every member name is
         # clean, so only a realpath-based check can catch it. abspath cannot.
-        link_dest = os.path.join(tmp, "out_link")
-        outside = os.path.join(tmp, "outside_target")
-        os.makedirs(link_dest)
-        os.makedirs(outside)
-        try:
-            os.symlink(outside, os.path.join(link_dest, "escape"), target_is_directory=True)
-            can_symlink = True
-        except (OSError, NotImplementedError, AttributeError):
-            can_symlink = False  # unprivileged Windows without Developer Mode
-        if can_symlink:
-            linked = _make_zip(os.path.join(zips, "linked.zip"), [("escape/pwned.txt", "pwned")])
+        def symlink_checks(make_link, tag):
+            link_dest = os.path.join(tmp, "out_link" + tag)
+            outside = os.path.join(tmp, "outside_target" + tag)
+            os.makedirs(link_dest)
+            os.makedirs(outside)
+            try:
+                make_link(outside, os.path.join(link_dest, "escape"), target_is_directory=True)
+            except (OSError, NotImplementedError, AttributeError):
+                # unprivileged Windows without Developer Mode: say so, do not pass
+                for part in ("refusal", "nothing written", "symlinked dest"):
+                    skip("symlink containment, %s: this host cannot create symlinks" % part)
+                return
+            linked = _make_zip(os.path.join(zips, "linked%s.zip" % tag),
+                               [("escape/pwned.txt", "pwned")])
             raises(lambda: safe_extract(linked, link_dest),
                    "a symlinked subdirectory of dest is refused (realpath, not abspath)",
                    UnsafeArchiveError)
@@ -1390,14 +1465,20 @@ def _self_test():
                   "nothing was written through the symlink")
             # ...and the mirror case: a dest that IS a symlink is the caller's own
             # choice of directory and must still extract, not trip containment.
-            sym_dest = os.path.join(tmp, "out_symdest")
-            os.symlink(os.path.join(tmp, "outside_target"), sym_dest, target_is_directory=True)
+            sym_dest = os.path.join(tmp, "out_symdest" + tag)
+            make_link(outside, sym_dest, target_is_directory=True)
             check(len(safe_extract(clean, sym_dest)) == 2,
                   "a dest that is itself a symlink still extracts (no false refusal)")
-        else:
-            check(True, "symlink containment: SKIPPED, this platform/user cannot create symlinks")
-            check(True, "symlink containment: SKIPPED (2 of 3)")
-            check(True, "symlink containment: SKIPPED (3 of 3)")
+
+        def no_symlinks(*_args, **_kwargs):
+            raise OSError("no privilege")
+        with contextlib.redirect_stdout(io.StringIO()):
+            symlink_checks(no_symlinks, "_none")
+        check(len(skipped) == 3 and all("cannot create symlinks" in line for line in skipped),
+              "a host that cannot make symlinks SKIPS the three containment checks, "
+              "it does not pass them  <-- pinned defect")
+        del skipped[:]
+        symlink_checks(os.symlink, "")
 
         # Two members writing one path: the second silently overwrites the first
         # under a plain extractall, and the returned list would claim both.
@@ -1540,7 +1621,7 @@ def _self_test():
         decoy_name = _touch(os.path.join(cnt_dir, "jobE_backup.log"), now_ts - 99 * day)
         _log_e, path_e = setup_logging("jobE", cnt_dir, retain_count=3, console=False)
         kept = sorted(f for f in os.listdir(cnt_dir) if _log_pattern("jobE").match(f))
-        check(len(kept) == 3, "prune-by-count keeps exactly N: got %s" % (kept,))
+        check(len(kept) == 3, "prune-by-count keeps exactly N (3 of 6 logs)")
         check(os.path.basename(path_e) in kept, "the log just opened counts toward N and survives")
         check("jobE_20200101_000000.log" not in kept, "prune-by-count drops the oldest first")
         check("jobE_20200105_000000.log" in kept, "prune-by-count keeps the newest of the old logs")
@@ -1672,6 +1753,19 @@ def _self_test():
               "moving a byte from one input to the next changes the fingerprint  <-- pinned defect")
         raises(lambda: fingerprint(os.path.join(st_dir, "missing.csv")),
                "a missing input raises instead of hashing to something", OSError)
+        twin = _touch(os.path.join(st_dir, "twin.csv"), body="id,y\n3,4\n")
+        check(fingerprint(twin) != fingerprint(in_a),
+              "the same bytes under another name change the fingerprint (a renamed input)")
+        # Without the size in each header, a list of two files can be forged by one
+        # file whose bytes imitate the second file's header.
+        forge1 = _touch(os.path.join(st_dir, "forge1"), body="p")
+        forge2 = _touch(os.path.join(st_dir, "forge2"), body="q")
+        pair = fingerprint([forge1, forge2])
+        second_name = os.fspath(forge2).encode("utf-8")
+        _touch(forge1, body="p" + (b"%d:" % len(second_name) + second_name).decode() + "q")
+        check(fingerprint([forge1]) != pair,
+              "one file imitating the next file's header cannot forge a two-file "
+              "fingerprint  <-- pinned defect")
 
         sp = os.path.join(st_dir, "state.json")
         cps = Checkpoints(sp, logger=st_log, run_key="2026-10-09")
@@ -1699,6 +1793,23 @@ def _self_test():
               "the failed step's reason quotes the ERROR it logged")
         check(not any(isinstance(h, ErrorCounter) for h in st_log.handlers),
               "the ERROR watcher is removed when the step ends")
+
+        # Checkpoints(path) with no logger: the step watches the ROOT logger, so a job
+        # that logs on its own logger, or on the root, still has its ERRORs counted.
+        plain = Checkpoints(os.path.join(st_dir, "plain.json"))
+        own_log = logging.getLogger("jobharness.selftest.nightly")
+        own_log.addHandler(logging.NullHandler())
+        with plain.step("geocode"):
+            own_log.error("half the rows failed")
+        check(plain.status("geocode") == FAILED and plain.is_done("geocode") is False,
+              "with no logger given, an ERROR on the job's own logger fails the step  "
+              "<-- pinned defect")
+        with plain.step("geocode2"):
+            logging.getLogger().error("on the root logger")
+        check(plain.status("geocode2") == FAILED,
+              "with no logger given, an ERROR on the root logger fails the step")
+        check(not any(isinstance(h, ErrorCounter) for h in logging.getLogger().handlers),
+              "the watcher is taken off the root logger when the step ends")
 
         st_log.error("an error logged before the step")
         child = logging.getLogger("jobharness.selftest.steps.child")
@@ -1750,6 +1861,52 @@ def _self_test():
         check(cps.is_done("redo") is False and "redo" not in cps.state["completed_steps"],
               "a step that was ok and then fails is no longer done  <-- pinned defect")
 
+        # run.data that json cannot encode (a Path, a date) is saved as text, and a
+        # failed write never hides the error the body already raised.
+        data_path = os.path.join(st_dir, "data.json")
+        data_cp = Checkpoints(data_path, logger=st_log)
+        with data_cp.step("publish", logger=st_log) as run:
+            run.data["when"] = _dt.date(2026, 1, 2)
+            run.data["where"] = pathlib.PurePath("out", "a.gdb")
+        saved = json.loads(_read(data_path))["data"]["publish"]
+        check(saved == {"when": "2026-01-02", "where": os.path.join("out", "a.gdb")},
+              "a date and a Path in run.data are saved as text, not a TypeError  <-- pinned defect")
+        check(not os.path.exists(data_path + ".tmp"), "and no half-written temp file is left")
+
+        unsavable = {(1, 2): "a tuple is not a JSON key"}
+
+        def write_fails_alone():
+            with data_cp.step("bad_data", logger=st_log) as run:
+                run.data.update(unsavable)
+        raises(write_fails_alone, "a state that cannot be written is an error", TypeError)
+        check(not os.path.exists(data_path + ".tmp"),
+              "a failed write removes its temp file  <-- pinned defect")
+
+        def write_fails_after_body_error():
+            with data_cp.step("bad_data2", logger=st_log) as run:
+                run.data.update(unsavable)
+                raise KeyError("the real failure")
+        st_capture.records = []
+        raises(write_fails_after_body_error,
+               "the body's own error, not the write error, reaches the caller  <-- pinned defect",
+               KeyError)
+        check(any("could not be recorded" in rec for rec in st_capture.records),
+              "and the write failure is logged")
+
+        # The reason lands in a file, so a secret in an exception or log text is blanked.
+        secret_cp = Checkpoints(os.path.join(st_dir, "secret.json"), logger=st_log)
+        secret_cp.record("a", FAILED, reason="url /q?f=json&token=SYN-TOKEN-1")
+        with secret_cp.step("b", logger=st_log):
+            st_log.error("login failed for https://svc:SYN-PW-2@host/x")
+        with secret_cp.step("c", logger=st_log):
+            st_log.error("sent Authorization: Bearer SYN-BEARER-3 and apikey=SYN-KEY-4")
+        secret_text = _read(secret_cp.path)
+        check("SYN-" not in secret_text and secret_text.count("<redacted>") == 4,
+              "token=, user:pass@, Authorization and apikey= values never reach the state "
+              "file  <-- pinned defect")
+        check(redact("no secret here: rows=5 key figures") == "no secret here: rows=5 key figures",
+              "text with no secret pattern is left alone")
+
         # Fingerprint is taken before the body: an input edited DURING the
         # step must not be recorded as the version the step read.
         live_in = _touch(os.path.join(st_dir, "live.csv"), body="v1")
@@ -1797,6 +1954,9 @@ def _self_test():
         check(rec_cp.is_done("fetch"), "record(OK) marks the step done")
         raises(lambda: rec_cp.record("fetch", "done"), "an unknown state is a ValueError")
         raises(lambda: rec_cp.record("fetch", FAILED), "a failed state with no reason is a ValueError")
+        raises(lambda: rec_cp.record("bogus_step", "bogus", reason="why"),
+               "an unknown state is refused even with a reason  <-- pinned defect")
+        check(rec_cp.status("bogus_step") is None, "and nothing was written for it")
 
         counter = ErrorCounter()
         counter_log = logging.getLogger("jobharness.selftest.counter")
@@ -2011,6 +2171,19 @@ def _self_test():
               "an unreadable lock older than that is stale")
         check("pid 4242 on HOST-A" in lock_verdict(info, 1100.0, "host-a", None, dead_fn, 0)[1],
               "the verdict names the pid and the host")
+        live_reason = lock_verdict(info, 1100.0, "host-a", None, alive_fn, 0)[1]
+        check("still running" in live_reason and "another host" not in live_reason,
+              "a live pid on this host says it is still running, not that it is unchecked")
+        check("0:00:00 ago" in lock_verdict(info, 900.0, "host-a", None, alive_fn, 0)[1],
+              "a lock stamped in the future reads as 0:00:00 old, never a negative age")
+        check(lock_verdict(None, 1010.0, here, None, alive_fn, 1000.0)[0] == STALE,
+              "an unreadable lock exactly at the write grace is stale (injected clock)")
+        check(lock_verdict(None, 1009.0, here, None, alive_fn, 1000.0)[0] == HELD,
+              "and one second inside the grace is held")
+        not_lock = lock_verdict(None, 9000.0, here, None, alive_fn, 1000.0, empty=False)
+        check(not_lock[0] == NOTLOCK and "not a lock record" in not_lock[1],
+              "text that is not a lock record is NOTLOCK however old, never stale  "
+              "<-- pinned defect")
 
         check(_pid_alive_posix(7, kill=lambda pid, sig: None) is True,
               "posix: a pid that accepts signal 0 is alive")
@@ -2139,8 +2312,39 @@ def _self_test():
         check(any("now belongs to another run" in r for r in rel_capture.records)
               and any("already gone" in r for r in rel_capture.records),
               "both odd releases are logged as warnings")
+        junk_lock = RunLock(os.path.join(lock_dir, "junk.lock"), logger=rel_log).acquire()
+        _touch(junk_lock.path, body="overwritten with text that is not a record")
+        junk_lock.release()
+        check(os.path.exists(junk_lock.path)
+              and any("now belongs to another run" in r for r in rel_capture.records[2:]),
+              "release() over a file that is no longer a record warns and leaves it, no crash"
+              "  <-- pinned defect")
         check(inspect_lock(lock_dir)[0] == HELD,
               "a lock path that cannot be read is held, never stale")
+
+        # A file that is not a lock record is somebody's data: never stale, never removed.
+        data_file = _touch(os.path.join(lock_dir, "parcels.csv"), body="id,x\n1,2\n")
+        os.utime(data_file, (time.time() - 3600, time.time() - 3600))
+        check(inspect_lock(data_file)[0] == NOTLOCK, "an hour-old data file is NOTLOCK, not stale")
+        code, out = cli(["--lock", data_file, "--apply"])
+        check(code == 5 and os.path.exists(data_file) and "not a lock" in out
+              and "Nothing was removed" in out,
+              "--lock --apply on a data file exits 5 and removes nothing  <-- pinned defect")
+        check(cli(["--lock", data_file])[0] == 5, "--lock on a data file exits 5")
+        not_lock_error = caught(RunLock(data_file).acquire, LockError)
+        check(not_lock_error is not None and not_lock_error.exit_code == 5
+              and os.path.exists(data_file),
+              "acquire() over a data file raises LockError with exit code 5 and leaves it")
+
+        # --apply must see the SAME stale lock twice, not just any two stale answers.
+        globals()["inspect_lock"] = lambda path, max_age=None: answers_b.pop(0)
+        answers_b = [(STALE, "old", "A"), (HELD, "its pid came back", "A")]
+        try:
+            code, out = cli(["--lock", lock_path, "--apply"])
+        finally:
+            globals()["inspect_lock"] = real_inspect
+        check(code == 3 and os.path.exists(lock_path) and "changed" in out,
+              "--apply removes nothing if the second look says held, even with the same text")
         raises(lambda: RunLock(lock_path, max_age=-1), "a negative max age is a ValueError")
         _touch(lock_path, body="")
         os.utime(lock_path, (time.time() - 3600, time.time() - 3600))
@@ -2152,6 +2356,11 @@ def _self_test():
         check(cli(["--lock", lock_path, "--max-a", "5"])[0] == 2,
               "a unique prefix --max-a of --max-age is refused too")
         check(cli(["--apply"])[0] == 2, "--apply without --lock is a usage error")
+        for argv in (["--lock", ""], ["--lock="], ["--lock", "  "], ["--lock", "", "--apply"]):
+            code, out = cli(argv)
+            check(code == 2 and out == "",
+                  "an empty --lock path %r is a usage error, not exit 0  <-- pinned defect"
+                  % (argv,))
         check(cli(["--lock", lock_path, "--max-age", "-1"])[0] == 2,
               "a negative --max-age is a usage error")
         check(_parse(["--lock", "x"]).apply is False, "--apply defaults to OFF")
@@ -2184,10 +2393,24 @@ def _self_test():
     del failed[mark:]
     check(len(probe) == 3 and probe_report == 1,
           "check() and raises() really do record a failure  <-- pinned defect")
+    # A skipped check must show in the summary and must not be counted as a pass.
+    sys.stdout = io.StringIO()
+    held_passed, held_skipped, held_failed = passed[0], list(skipped), list(failed)
+    del skipped[:], failed[:]
+    try:
+        skip("probe: a check that could not run")
+        skip_report = report()
+        skip_text = sys.stdout.getvalue()
+    finally:
+        sys.stdout = out
+        skipped[:], failed[:] = held_skipped, held_failed
+    check(skip_report == 0 and passed[0] == held_passed and "1 check(s) SKIPPED" in skip_text,
+          "a skipped check is listed in the summary and is not counted as a pass  "
+          "<-- pinned defect")
     check(caught(lambda: None) is None, "caught() returns None when nothing is raised")
 
     return report()
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no branch  (the false side is an import; the measured run is a script)
     sys.exit(main())
